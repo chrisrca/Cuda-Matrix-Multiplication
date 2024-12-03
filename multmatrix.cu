@@ -4,6 +4,9 @@
 #include <chrono>
 #include <cmath>
 #include <sstream>
+#include <vector>
+#include <cstdlib>
+#include <ctime>
 
 #define TILE_SIZE 64 // Tile size for chunking
 
@@ -18,7 +21,6 @@ __global__ void tiledMatrixMulKernel(float *a, float *b, float *c, int n) {
     float value = 0.0f;
 
     for (int tile = 0; tile < (n + TILE_SIZE - 1) / TILE_SIZE; ++tile) {
-        // Load tiles into shared memory
         if (row < n && (tile * TILE_SIZE + threadIdx.x) < n) {
             shared_a[threadIdx.y][threadIdx.x] = a[row * n + tile * TILE_SIZE + threadIdx.x];
         } else {
@@ -45,43 +47,57 @@ __global__ void tiledMatrixMulKernel(float *a, float *b, float *c, int n) {
     }
 }
 
-// Host function for matrix multiplication
+// Host function for GPU matrix multiplication
 void chunkedMatrixMul(float *a, float *b, float *c, int n) {
     float *d_a, *d_b, *d_c;
 
-    // Allocate GPU memory
     size_t size = n * n * sizeof(float);
     cudaMalloc((void **)&d_a, size);
     cudaMalloc((void **)&d_b, size);
     cudaMalloc((void **)&d_c, size);
 
-    // Copy input matrices to GPU
     cudaMemcpy(d_a, a, size, cudaMemcpyHostToDevice);
     cudaMemcpy(d_b, b, size, cudaMemcpyHostToDevice);
     cudaMemset(d_c, 0, size);
 
-    // Launch kernel
     dim3 threadsPerBlock(TILE_SIZE, TILE_SIZE);
     dim3 blocksPerGrid((n + TILE_SIZE - 1) / TILE_SIZE, (n + TILE_SIZE - 1) / TILE_SIZE);
 
-    // Start timing only for the computation
     auto start = std::chrono::high_resolution_clock::now();
     tiledMatrixMulKernel<<<blocksPerGrid, threadsPerBlock>>>(d_a, d_b, d_c, n);
-    cudaDeviceSynchronize(); // Ensure all threads finish before timing ends
+    cudaDeviceSynchronize();
     auto end = std::chrono::high_resolution_clock::now();
 
     std::chrono::duration<float, std::milli> duration = end - start;
 
     std::cout << std::left << std::setw(15) << (std::to_string(n) + " x " + std::to_string(n))
-              << std::setw(15) << duration.count() << std::endl;
+              << std::setw(15) << duration.count();
 
-    // Copy result matrix back to host
     cudaMemcpy(c, d_c, size, cudaMemcpyDeviceToHost);
 
-    // Free GPU memory
     cudaFree(d_a);
     cudaFree(d_b);
     cudaFree(d_c);
+}
+
+// CPU-based matrix multiplication
+void cpuMatrixMul(const float *a, const float *b, float *c, int n) {
+    auto start = std::chrono::high_resolution_clock::now();
+
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < n; ++j) {
+            float value = 0.0f;
+            for (int k = 0; k < n; ++k) {
+                value += a[i * n + k] * b[k * n + j];
+            }
+            c[i * n + j] = value;
+        }
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<float, std::milli> duration = end - start;
+
+    std::cout << std::setw(15) << duration.count() << std::endl;
 }
 
 // Warm-up function to initialize CUDA runtime
@@ -97,39 +113,56 @@ void warmupKernel() {
 
 int main() {
     const int MAX_SIZE = 32768; // Maximum matrix size
+    const int CPU_CUTOFF = 2048; // Cutoff size for CPU computations
 
     std::cout << std::left << std::setw(15) << "Size"
-              << std::setw(15) << "Time (ms)" << std::endl;
-    std::cout << std::string(25, '-') << std::endl;
+              << std::setw(15) << "GPU Time (ms)"
+              << std::setw(15) << "CPU Time (ms)" << std::endl;
+    std::cout << std::string(45, '-') << std::endl;
 
     warmupKernel();
 
     for (int size = 2; size <= MAX_SIZE; size *= 2) {
-        // Allocate host memory
         float *a = (float *)malloc(size * size * sizeof(float));
         float *b = (float *)malloc(size * size * sizeof(float));
-        float *c = (float *)malloc(size * size * sizeof(float));
+        float *gpu_c = (float *)malloc(size * size * sizeof(float));
+        float *cpu_c = nullptr;
 
-        if (!a || !b || !c) {
+        if (!a || !b || !gpu_c) {
             std::cerr << "Error allocating host memory for size: " << size << std::endl;
             exit(EXIT_FAILURE);
         }
 
-        // Initialize matrices with random values
+        if (size <= CPU_CUTOFF) {
+            cpu_c = (float *)malloc(size * size * sizeof(float));
+            if (!cpu_c) {
+                std::cerr << "Error allocating host memory for CPU computation at size: " << size << std::endl;
+                exit(EXIT_FAILURE);
+            }
+        }
+
         srand(time(NULL));
         for (int i = 0; i < size * size; ++i) {
             a[i] = static_cast<float>(rand()) / RAND_MAX;
             b[i] = static_cast<float>(rand()) / RAND_MAX;
-            c[i] = 0.0f;
+            gpu_c[i] = 0.0f;
+            if (cpu_c) cpu_c[i] = 0.0f;
         }
 
-        // Perform matrix multiplication and time it
-        chunkedMatrixMul(a, b, c, size);
+        // GPU calculation
+        chunkedMatrixMul(a, b, gpu_c, size);
 
-        // Free host memory
+        // CPU calculation if size <= CPU_CUTOFF
+        if (size <= CPU_CUTOFF) {
+            cpuMatrixMul(a, b, cpu_c, size);
+        } else {
+            std::cout << std::setw(15) << "N/A" << std::endl;
+        }
+
         free(a);
         free(b);
-        free(c);
+        free(gpu_c);
+        if (cpu_c) free(cpu_c);
     }
 
     return 0;
